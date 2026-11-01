@@ -2021,8 +2021,8 @@ const make = Effect.gen(function* () {
 			readonly attempt: number
 			readonly retry: Execution.Retry
 			readonly input: Schema.Json
-			readonly readRetryFailure?: Execution.Failure | undefined
 		},
+		readRetryFailure?: Execution.Failure,
 	) {
 		return yield* sql.withTransaction(
 			Effect.gen(function* () {
@@ -2064,14 +2064,12 @@ const make = Effect.gen(function* () {
 						yield* Schema.encodeEffect(json)(input.input),
 					),
 					readRetryFailure:
-						input.readRetryFailure === undefined
+						readRetryFailure === undefined
 							? null
 							: yield* seal(
 									key,
 									`call:${id}:readRetryFailure`,
-									yield* Schema.encodeEffect(failureCodec)(
-										input.readRetryFailure,
-									),
+									yield* Schema.encodeEffect(failureCodec)(readRetryFailure),
 								),
 					createdAt: now,
 					updatedAt: now,
@@ -2154,13 +2152,16 @@ const make = Effect.gen(function* () {
 							exhaustedReadRetry: readRetryFailure,
 						}
 				}
-				const call = yield* intent(key, {
-					step,
-					attempt: prior === undefined ? 0 : prior.attempt + 1,
-					retry: "read_only",
-					input,
+				const call = yield* intent(
+					key,
+					{
+						step,
+						attempt: prior === undefined ? 0 : prior.attempt + 1,
+						retry: "read_only",
+						input,
+					},
 					readRetryFailure,
-				})
+				)
 				yield* append(
 					key,
 					execution.sequence + 1,

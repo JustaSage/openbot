@@ -552,6 +552,10 @@ layer(services, { excludeTestServices: true, timeout: "60 seconds" })((it) => {
 				if (boundary !== "after the first failure") {
 					const final = yield* store.readAttempt(sender, step, null, first.id)
 					assert.strictEqual(final.attempt, 1)
+					assert.deepStrictEqual(
+						yield* store.latestCall(sender, step),
+						Option.some(final),
+					)
 					if (boundary === "after the final send")
 						yield* store.sending(sender, final.id)
 				}
