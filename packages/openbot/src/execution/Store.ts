@@ -90,6 +90,10 @@ export interface Key {
 	readonly namespace: string
 	readonly id: Execution.Id
 }
+/** An unfinished model read can carry a private reason to stop after its last attempt. */
+export interface ReadAttempt extends Execution.Call {
+	readonly exhaustedReadRetry?: Execution.Failure
+}
 export interface Fence extends Key {
 	readonly generation: number
 }
@@ -98,7 +102,6 @@ const sameJson = Schema.toEquivalence(Schema.Json)
 const identityCodec = Schema.fromJsonString(WorkIdentity)
 const eventCodec = Schema.fromJsonString(Execution.EventBody)
 const failureCodec = Schema.fromJsonString(Execution.Failure)
-
 const known = Schema.Union([
 	Execution.NotFound,
 	Execution.Conflict,
@@ -533,8 +536,9 @@ export interface Service {
 		key: Fence,
 		step: string,
 		input: Schema.Json,
+		retryFrom?: Execution.CallId | undefined,
 	) => Effect.Effect<
-		Execution.Call,
+		ReadAttempt,
 		Execution.Conflict | Execution.NotFound | Execution.StorageError
 	>
 	readonly writeAttempt: (
@@ -687,6 +691,7 @@ export interface Service {
 	readonly incompleteRead: (
 		key: Fence,
 		id: Execution.CallId,
+		lastRetry?: Execution.Failure | undefined,
 	) => Effect.Effect<
 		void,
 		Execution.Conflict | Execution.NotFound | Execution.StorageError
@@ -2016,6 +2021,7 @@ const make = Effect.gen(function* () {
 			readonly attempt: number
 			readonly retry: Execution.Retry
 			readonly input: Schema.Json
+			readonly readRetryFailure?: Execution.Failure | undefined
 		},
 	) {
 		return yield* sql.withTransaction(
@@ -2057,6 +2063,16 @@ const make = Effect.gen(function* () {
 						`call:${id}:input`,
 						yield* Schema.encodeEffect(json)(input.input),
 					),
+					readRetryFailure:
+						input.readRetryFailure === undefined
+							? null
+							: yield* seal(
+									key,
+									`call:${id}:readRetryFailure`,
+									yield* Schema.encodeEffect(failureCodec)(
+										input.readRetryFailure,
+									),
+								),
 					createdAt: now,
 					updatedAt: now,
 				})
@@ -2075,6 +2091,7 @@ const make = Effect.gen(function* () {
 		key: Fence,
 		step: string,
 		input: Schema.Json,
+		retryFrom?: Execution.CallId,
 	) {
 		return yield* sql.withTransaction(
 			Effect.gen(function* () {
@@ -2094,14 +2111,23 @@ const make = Effect.gen(function* () {
 					.orderBy(desc(executionCalls.attempt))
 					.limit(1)
 					.for("update")
+				let readRetryFailure: Execution.Failure | undefined
 				if (prior !== undefined) {
 					const call = yield* callView(prior)
 					if (call.retry !== "read_only" || !sameJson(call.input, input))
 						return yield* Execution.Conflict.make({ id: key.id })
-					if (call.status === "completed" || call.status === "intended")
-						return call
+					if (call.status === "completed") return call
 					if (call.status === "sending" && prior.generation === key.generation)
 						return yield* Execution.Conflict.make({ id: key.id })
+					if (call.status === "intended" && prior.readRetryFailure === null)
+						return call
+					if (prior.readRetryFailure !== null) {
+						readRetryFailure = yield* open(
+							key,
+							`call:${call.id}:readRetryFailure`,
+							prior.readRetryFailure,
+						).pipe(Effect.flatMap(Schema.decodeEffect(failureCodec)))
+					}
 					// The old provider may have billed the request. This does not claim zero usage.
 					yield* db
 						.update(executionCalls)
@@ -2115,12 +2141,25 @@ const make = Effect.gen(function* () {
 								eq(executionCalls.id, call.id),
 							),
 						)
+					// Only the worker handling the first failure may start its retry.
+					if (
+						readRetryFailure !== undefined &&
+						(call.attempt !== 0 ||
+							prior.generation !== key.generation ||
+							retryFrom !== call.id)
+					)
+						return {
+							...call,
+							status: "outcome_unknown" as const,
+							exhaustedReadRetry: readRetryFailure,
+						}
 				}
 				const call = yield* intent(key, {
 					step,
 					attempt: prior === undefined ? 0 : prior.attempt + 1,
 					retry: "read_only",
 					input,
+					readRetryFailure,
 				})
 				yield* append(
 					key,
@@ -2491,6 +2530,7 @@ const make = Effect.gen(function* () {
 		key: Fence,
 		id: Execution.CallId,
 		pause: boolean,
+		lastRetry?: Execution.Failure | undefined,
 	) {
 		yield* sql.withTransaction(
 			Effect.gen(function* () {
@@ -2508,7 +2548,10 @@ const make = Effect.gen(function* () {
 					.for("update")
 				if (call === undefined)
 					return yield* Execution.NotFound.make({ id: key.id })
-				if (!pause && call.retry !== "read_only")
+				if (
+					(!pause && call.retry !== "read_only") ||
+					(lastRetry !== undefined && (pause || call.attempt !== 0))
+				)
 					return yield* Execution.Conflict.make({ id: key.id })
 				if (call.status === "completed" || call.status === "outcome_unknown")
 					return
@@ -2517,7 +2560,19 @@ const make = Effect.gen(function* () {
 				const now = yield* Clock.currentTimeMillis
 				yield* db
 					.update(executionCalls)
-					.set({ status: "outcome_unknown", updatedAt: now })
+					.set({
+						status: "outcome_unknown",
+						updatedAt: now,
+						...(lastRetry === undefined
+							? {}
+							: {
+									readRetryFailure: yield* seal(
+										key,
+										`call:${id}:readRetryFailure`,
+										yield* Schema.encodeEffect(failureCodec)(lastRetry),
+									),
+								}),
+					})
 					.where(
 						and(
 							eq(executionCalls.namespace, key.namespace),
@@ -2559,8 +2614,11 @@ const make = Effect.gen(function* () {
 	}, storage)
 	const uncertain = (key: Fence, id: Execution.CallId) =>
 		markUnknown(key, id, true)
-	const incompleteRead = (key: Fence, id: Execution.CallId) =>
-		markUnknown(key, id, false)
+	const incompleteRead = (
+		key: Fence,
+		id: Execution.CallId,
+		lastRetry?: Execution.Failure,
+	) => markUnknown(key, id, false, lastRetry)
 	/** Late results are saved. Only the current running attempt may publish completion. */
 	const finishCall = Effect.fn("ExecutionStore.finishCall")(function* <
 		E = never,
